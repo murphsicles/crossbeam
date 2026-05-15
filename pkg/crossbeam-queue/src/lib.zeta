@@ -1,0 +1,9 @@
+// Auto-converted from /tmp/df-crossbeam-queue-0.3.12/crossbeam-queue-0.3.12/src/lib.rs
+
+// [unsupported item]
+// [unsupported item]
+#[cfg(all(feature = "alloc", target_has_atomic = "ptr"))]
+mod array_queue;
+#[cfg(all(feature = "alloc", target_has_atomic = "ptr"))]
+mod seg_queue;
+#[cfg(all(feature = "alloc", target_has_atomic = "ptr"))] pub use crate::{ array_queue::ArrayQueue, seg_queue::SegQueue };

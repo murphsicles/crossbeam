@@ -1,0 +1,16 @@
+[package]
+name = "@sync/crossbeam"
+version = "0.8.4"
+description = "Concurrency tools for Zeta — channels, epoch GC, work-stealing deque, concurrent queues"
+license = "MIT"
+repository = "https://github.com/murphsicles/crossbeam"
+readme = "README.md"
+
+[workspace]
+members = [
+    "pkg/crossbeam-channel",
+    "pkg/crossbeam-epoch",
+    "pkg/crossbeam-deque",
+    "pkg/crossbeam-utils",
+    "pkg/crossbeam-queue",
+]

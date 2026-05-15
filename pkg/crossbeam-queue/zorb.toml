@@ -1,0 +1,5 @@
+[package]
+name = "@sync/crossbeam-queue"
+version = "0.1.0"
+description = "Zeta port of crossbeam-queue"
+license = "MIT"

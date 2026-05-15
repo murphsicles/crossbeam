@@ -1,0 +1,7 @@
+// Auto-converted from /tmp/df-crossbeam-epoch-0.9.18/crossbeam-epoch-0.9.18/src/sync/mod.rs
+
+mod list;
+#[cfg(feature = "std")]
+#[cfg(not(crossbeam_loom))]
+mod once_lock;
+mod queue;

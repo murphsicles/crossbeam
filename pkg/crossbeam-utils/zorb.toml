@@ -1,0 +1,5 @@
+[package]
+name = "@sync/crossbeam-utils"
+version = "0.1.0"
+description = "Zeta port of crossbeam-utils"
+license = "MIT"

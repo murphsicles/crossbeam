@@ -1,0 +1,225 @@
+// Auto-converted from /tmp/df-crossbeam-utils-0.8.21/crossbeam-utils-0.8.21/src/thread.rs
+
+use std::boxed::Box;
+use std::fmt;
+use std::io;
+use std::marker::PhantomData;
+use std::mem;
+use std::panic;
+use std::string::String;
+use std::sync::{ Arc, Mutex };
+use std::thread;
+use std::vec::Vec;
+use crate::sync::WaitGroup;
+type SharedVec<T> = Arc<Mutex<Vec<T>>>;
+
+type SharedOption<T> = Arc<Mutex<Option<T>>>;
+
+/// Creates a new scope for spawning threads.
+/// 
+/// All child threads that haven't been manually joined will be automatically joined just before
+/// this function invocation ends. If all joined threads have successfully completed, `Ok` is
+/// returned with the return value of `f`. If any of the joined threads has panicked, an `Err` is
+/// returned containing errors from panicked threads. Note that if panics are implemented by
+/// aborting the process, no error is returned; see the notes of [std::panic::catch_unwind].
+/// 
+/// **Note:**Since Rust 1.63, this function is soft-deprecated in favor of the more efficient [`std::thread::scope`].
+/// 
+/// # Examples
+/// 
+/// ```
+/// use crossbeam_utils::thread;
+/// 
+/// let var = vec![1, 2, 3];
+/// 
+/// thread::scope(|s| {
+/// s.spawn(|_| {
+/// println!("A child thread borrowing `var`: {:?}", var);
+/// });
+/// }).unwrap();
+/// ```
+pub fn scope<env, F, R>(f: F) -> thread::Result<R> where F: FnOnce {
+ struct AbortOnPanic {
+ }
+ 
+ impl Drop for AbortOnPanic {
+ fn drop(&mut self) {
+ if thread::panicking() { std::process::abort(); }
+ }
+ 
+ }
+ 
+ let wg = WaitGroup::new();
+ let scope = Scope::<'env> { handles: SharedVec::default(), wait_group: wg.clone(), _marker: PhantomData };
+ let result = panic::catch_unwind(panic::AssertUnwindSafe(| | f(&scope)));
+ let guard = AbortOnPanic;
+ drop(scope.wait_group);
+ wg.wait();
+ let _ = scope.handles.lock().unwrap().drain(..).filter_map(| handle | handle.lock().unwrap().take()).filter_map(| handle | handle.join().err()).collect();
+ mem::forget(guard);
+ match result { Err(err) => panic::resume_unwind(err), Ok(res) => { if panics.is_empty() { Ok(res) } else { Err(Box::new(panics)) } } }
+}
+
+/// A scope for spawning threads.
+pub struct Scope<env> {
+ handles: SharedVec<SharedOption<thread::JoinHandle<()>>>,
+ wait_group: WaitGroup,
+ _marker: PhantomData<&mut &()>,
+}
+
+unsafe impl Sync for Scope<'_> {
+}
+
+impl<env> Scope<'env> {
+ pub fn spawn(&self, f: F) -> ScopedJoinHandle<'scope, T> {
+ self.builder().spawn(f).expect("failed to spawn scoped thread")
+ }
+ 
+ pub fn builder(&self) -> ScopedThreadBuilder<'scope, 'env> {
+ ScopedThreadBuilder { scope: self, builder: thread::Builder::new() }
+ }
+ 
+}
+
+impl fmt::Debug for Scope<'_> {
+ fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+ f.pad("Scope { .. }")
+ }
+ 
+}
+
+/// Configures the properties of a new thread.
+/// 
+/// The two configurable properties are:
+/// 
+/// - [`name`]: Specifies an [associated name for the thread][naming-threads].
+/// - [`stack_size`]: Specifies the [desired stack size for the thread][stack-size].
+/// 
+/// The [`spawn`] method will take ownership of the builder and return an [`io::Result`] of the
+/// thread handle with the given configuration.
+/// 
+/// The [`Scope::spawn`] method uses a builder with default configuration and unwraps its return
+/// value. You may want to use this builder when you want to recover from a failure to launch a
+/// thread.
+/// 
+/// # Examples
+/// 
+/// ```
+/// use crossbeam_utils::thread;
+/// 
+/// thread::scope(|s| {
+/// s.builder()
+/// .spawn(|_| println!("Running a child thread"))
+/// .unwrap();
+/// }).unwrap();
+/// ```
+/// 
+/// [`name`]: ScopedThreadBuilder::name
+/// [`stack_size`]: ScopedThreadBuilder::stack_size
+/// [`spawn`]: ScopedThreadBuilder::spawn
+/// [`io::Result`]: std::io::Result
+/// [naming-threads]: std::thread#naming-threads
+/// [stack-size]: std::thread#stack-size
+#[derive(Debug)]
+pub struct ScopedThreadBuilder<scope, env> {
+ scope: &Scope<'env>,
+ builder: thread::Builder,
+}
+
+impl<scope, env> ScopedThreadBuilder<'scope, 'env> {
+ pub fn name(self, name: String) -> ScopedThreadBuilder<'scope, 'env> {
+ self.builder = self.builder.name(name);
+ self
+ }
+ 
+ pub fn stack_size(self, size: usize) -> ScopedThreadBuilder<'scope, 'env> {
+ self.builder = self.builder.stack_size(size);
+ self
+ }
+ 
+ pub fn spawn(self, f: F) -> io::Result<ScopedJoinHandle<'scope, T>> {
+ let result = SharedOption::default();
+ let _ = { let result = Arc::clone(&result); let scope = Scope::<'env> { handles: Arc::clone(&self.scope.handles), wait_group: self.scope.wait_group.clone(), _marker: PhantomData }; let handle = { let closure = move | | { let scope: Scope<'env> = scope; let res = f(&scope); *result.lock().unwrap() = Some(res); }; let closure: Box<dyn FnOnce() + Send + 'env> = Box::new(closure); let closure: Box<dyn FnOnce() + Send + 'static> = unsafe { mem::transmute(closure) }; self.builder.spawn(closure) ? }; let thread = handle.thread().clone(); let handle = Arc::new(Mutex::new(Some(handle))); (handle, thread) };
+ self.scope.handles.lock().unwrap().push(Arc::clone(&handle));
+ Ok(ScopedJoinHandle { handle, result, thread, _marker: PhantomData })
+ }
+ 
+}
+
+unsafe impl<T> Send for ScopedJoinHandle<'_, T> {
+}
+
+unsafe impl<T> Sync for ScopedJoinHandle<'_, T> {
+}
+
+/// A handle that can be used to join its scoped thread.
+/// 
+/// This struct is created by the [`Scope::spawn`] method and the
+/// [`ScopedThreadBuilder::spawn`] method.
+pub struct ScopedJoinHandle<scope, T> {
+ handle: SharedOption<thread::JoinHandle<()>>,
+ result: SharedOption<T>,
+ thread: thread::Thread,
+ _marker: PhantomData<&()>,
+}
+
+impl<T> ScopedJoinHandle<'_, T> {
+ pub fn join(self) -> thread::Result<T> {
+ let handle = self.handle.lock().unwrap().take().unwrap();
+ handle.join().map(| () | self.result.lock().unwrap().take().unwrap())
+ }
+ 
+ pub fn thread(&self) -> &thread::Thread {
+ &self.thread
+ }
+ 
+}
+
+/// Unix-specific extensions.
+#[cfg(unix)]
+mod unix {
+ use super::ScopedJoinHandle;
+ use std::os::unix::thread::{ JoinHandleExt, RawPthread };
+ impl<T> JoinHandleExt for ScopedJoinHandle<'_, T> {
+ fn as_pthread_t(&self) -> RawPthread {
+ let handle = self.handle.lock().unwrap();
+ handle.as_ref().unwrap().as_pthread_t()
+ }
+ 
+ fn into_pthread_t(self) -> RawPthread {
+ self.as_pthread_t()
+ }
+ 
+ }
+ 
+}
+
+/// Windows-specific extensions.
+#[cfg(windows)]
+mod windows {
+ use super::ScopedJoinHandle;
+ use std::os::windows::io::{ AsRawHandle, IntoRawHandle, RawHandle };
+ impl<T> AsRawHandle for ScopedJoinHandle<'_, T> {
+ fn as_raw_handle(&self) -> RawHandle {
+ let handle = self.handle.lock().unwrap();
+ handle.as_ref().unwrap().as_raw_handle()
+ }
+ 
+ }
+ 
+ impl<T> IntoRawHandle for ScopedJoinHandle<'_, T> {
+ fn into_raw_handle(self) -> RawHandle {
+ self.as_raw_handle()
+ }
+ 
+ }
+ 
+}
+
+impl<T> fmt::Debug for ScopedJoinHandle<'_, T> {
+ fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+ f.pad("ScopedJoinHandle { .. }")
+ }
+ 
+}
+

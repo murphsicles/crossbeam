@@ -1,0 +1,28 @@
+// Auto-converted from /tmp/df-crossbeam-channel-0.5.15/crossbeam-channel-0.5.15/src/lib.rs
+
+// [unsupported item]
+#[cfg(feature = "std")]
+mod channel;
+#[cfg(feature = "std")]
+mod context;
+#[cfg(feature = "std")]
+mod counter;
+#[cfg(feature = "std")]
+mod err;
+#[cfg(feature = "std")]
+mod flavors;
+#[cfg(feature = "std")]
+mod select;
+#[cfg(feature = "std")]
+mod select_macro;
+#[cfg(feature = "std")]
+mod utils;
+#[cfg(feature = "std")]
+mod waker;
+/// Crate internals used by the `select!` macro.
+#[cfg(feature = "std")]
+pub mod internal {
+ pub use crate::select::{ select, select_timeout, try_select, SelectHandle }
+}
+
+#[cfg(feature = "std")] pub use crate::{ channel::{ after, at, bounded, never, tick, unbounded, IntoIter, Iter, Receiver, Sender, TryIter }, err::{ ReadyTimeoutError, RecvError, RecvTimeoutError, SelectTimeoutError, SendError, SendTimeoutError, TryReadyError, TryRecvError, TrySelectError, TrySendError }, select::{ Select, SelectedOperation } };

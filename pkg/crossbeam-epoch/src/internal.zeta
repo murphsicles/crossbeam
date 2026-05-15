@@ -1,0 +1,271 @@
+// Auto-converted from /tmp/df-crossbeam-epoch-0.9.18/crossbeam-epoch-0.9.18/src/internal.rs
+
+use crate::primitive::cell::UnsafeCell;
+use crate::primitive::sync::atomic::{ self, Ordering };
+use core::cell::Cell;
+use core::mem::{ self, ManuallyDrop };
+use core::num::Wrapping;
+use core::{ fmt, ptr };
+use crossbeam_utils::CachePadded;
+use crate::atomic::{ Owned, Shared };
+use crate::collector::{ Collector, LocalHandle };
+use crate::deferred::Deferred;
+use crate::epoch::{ AtomicEpoch, Epoch };
+use crate::guard::{ unprotected, Guard };
+use crate::sync::list::{ Entry, IsElement, IterError, List };
+use crate::sync::queue::Queue;
+const MAX_OBJECTS: usize = 64;
+
+const MAX_OBJECTS: usize = 4;
+
+/// A bag of deferred functions.
+struct Bag {
+ deferreds: [Deferred; MAX_OBJECTS],
+ len: usize,
+}
+
+/// `Bag::try_push()` requires that it is safe for another thread to execute the given functions.
+unsafe impl Send for Bag {
+}
+
+impl Bag {
+ fn new() -> Self {
+ Self::default()
+ }
+ 
+ fn is_empty(&self) -> bool {
+ self.len == 0
+ }
+ 
+ fn try_push(&mut self, deferred: Deferred) -> Result<(), Deferred> {
+ if self.len<MAX_OBJECTS { self.deferreds [self.len] = deferred; self.len += 1; Ok(()) } else { Err(deferred) }
+ }
+ 
+ fn seal(self, epoch: Epoch) -> SealedBag {
+ SealedBag { epoch, _bag: self }
+ }
+ 
+}
+
+impl Default for Bag {
+ fn default() -> Self {
+ Bag { len: 0, deferreds: [Deferred::NO_OP; MAX_OBJECTS] }
+ }
+ 
+}
+
+impl Drop for Bag {
+ fn drop(&mut self) {
+ for deferred in &mut self.deferreds [.. self.len] { let no_op = Deferred::NO_OP; let owned_deferred = mem::replace(deferred, no_op); owned_deferred.call(); }
+ }
+ 
+}
+
+impl fmt::Debug for Bag {
+ fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+ f.debug_struct("Bag").field("deferreds", & &self.deferreds [.. self.len]).finish()
+ }
+ 
+}
+
+/// A pair of an epoch and a bag.
+#[derive(Default, Debug)]
+struct SealedBag {
+ epoch: Epoch,
+ _bag: Bag,
+}
+
+/// It is safe to share `SealedBag` because `is_expired` only inspects the epoch.
+unsafe impl Sync for SealedBag {
+}
+
+impl SealedBag {
+ fn is_expired(&self, global_epoch: Epoch) -> bool {
+ global_epoch.wrapping_sub(self.epoch) >= 2
+ }
+ 
+}
+
+/// The global data for a garbage collector.
+struct Global {
+ locals: List<Local>,
+ queue: Queue<SealedBag>,
+ epoch: CachePadded<AtomicEpoch>,
+}
+
+impl Global {
+ const COLLECT_STEPS: usize = 8;
+ fn new() -> Self {
+ Self { locals: List::new(), queue: Queue::new(), epoch: CachePadded::new(AtomicEpoch::new(Epoch::starting())) }
+ }
+ 
+ fn push_bag(&self, bag: &mut Bag, guard: &Guard) {
+ let bag = mem::replace(bag, Bag::new());
+ atomic::fence(Ordering::SeqCst);
+ let epoch = self.epoch.load(Ordering::Relaxed);
+ self.queue.push(bag.seal(epoch), guard);
+ }
+ 
+ fn collect(&self, guard: &Guard) {
+ let global_epoch = self.try_advance(guard);
+ let steps = if cfg!(crossbeam_sanitize) { usize::max_value() } else { Self::COLLECT_STEPS };
+ for _ in 0 .. steps { match self.queue.try_pop_if(& | sealed_bag: &SealedBag | sealed_bag.is_expired(global_epoch), guard ) { None => break, Some(sealed_bag) => drop(sealed_bag) } }
+ }
+ 
+ fn try_advance(&self, guard: &Guard) -> Epoch {
+ let global_epoch = self.epoch.load(Ordering::Relaxed);
+ atomic::fence(Ordering::SeqCst);
+ for local in self.locals.iter(guard) { match local { Err(IterError::Stalled) => { return global_epoch; } Ok(local) => { let local_epoch = local.epoch.load(Ordering::Relaxed); if local_epoch.is_pinned() &&local_epoch.unpinned() != global_epoch { return global_epoch; } } } }
+ atomic::fence(Ordering::Acquire);
+ let new_epoch = global_epoch.successor();
+ self.epoch.store(new_epoch, Ordering::Release);
+ new_epoch
+ }
+ 
+}
+
+/// Participant for garbage collection.
+#[repr(C)]
+struct Local {
+ entry: Entry,
+ collector: UnsafeCell<ManuallyDrop<Collector>>,
+ bag: UnsafeCell<Bag>,
+ guard_count: Cell<usize>,
+ handle_count: Cell<usize>,
+ pin_count: Cell<Wrapping<usize>>,
+ epoch: CachePadded<AtomicEpoch>,
+}
+
+#[cfg(not(any(crossbeam_sanitize, miri)))]
+#[test]
+fn local_size() {
+}
+
+impl Local {
+ const PINNINGS_BETWEEN_COLLECT: usize = 128;
+ fn register(collector: &Collector) -> LocalHandle {
+ unsafe { let local = Owned::new(Local { entry: Entry::default(), collector: UnsafeCell::new(ManuallyDrop::new(collector.clone())), bag: UnsafeCell::new(Bag::new()), guard_count: Cell::new(0), handle_count: Cell::new(1), pin_count: Cell::new(Wrapping(0)), epoch: CachePadded::new(AtomicEpoch::new(Epoch::starting())) }).into_shared(unprotected()); collector.global.locals.insert(local, unprotected()); LocalHandle { local: local.as_raw() } }
+ }
+ 
+ fn global(&self) -> &Global {
+ &self.collector().global
+ }
+ 
+ fn collector(&self) -> &Collector {
+ self.collector.with(| c | unsafe { &* *c })
+ }
+ 
+ fn is_pinned(&self) -> bool {
+ self.guard_count.get() > 0
+ }
+ 
+ fn defer(&self, deferred: Deferred, guard: &Guard) {
+ let bag = self.bag.with_mut(| b | &mut * b);
+ while let Err(d) = bag.try_push(deferred) { self.global().push_bag(bag, guard); deferred = d; }
+ }
+ 
+ fn flush(&self, guard: &Guard) {
+ let bag = self.bag.with_mut(| b | unsafe { &mut * b });
+ if ! bag.is_empty() { self.global().push_bag(bag, guard); }
+ self.global().collect(guard);
+ }
+ 
+ fn pin(&self) -> Guard {
+ let guard = Guard { local: self };
+ let guard_count = self.guard_count.get();
+ self.guard_count.set(guard_count.checked_add(1).unwrap());
+ if guard_count == 0 { let global_epoch = self.global().epoch.load(Ordering::Relaxed); let new_epoch = global_epoch.pinned(); if cfg!(all(any(target_arch = "x86", target_arch = "x86_64"), not(miri))) { let current = Epoch::starting(); let res = self.epoch.compare_exchange(current, new_epoch, Ordering::SeqCst, Ordering::SeqCst ); debug_assert!(res.is_ok(), "participant was expected to be unpinned"); atomic::compiler_fence(Ordering::SeqCst); } else { self.epoch.store(new_epoch, Ordering::Relaxed); atomic::fence(Ordering::SeqCst); } let count = self.pin_count.get(); self.pin_count.set(count + Wrapping(1)); if count.0 % Self::PINNINGS_BETWEEN_COLLECT == 0 { self.global().collect(&guard); } }
+ guard
+ }
+ 
+ fn unpin(&self) {
+ let guard_count = self.guard_count.get();
+ self.guard_count.set(guard_count - 1);
+ if guard_count == 1 { self.epoch.store(Epoch::starting(), Ordering::Release); if self.handle_count.get() == 0 { self.finalize(); } }
+ }
+ 
+ fn repin(&self) {
+ let guard_count = self.guard_count.get();
+ if guard_count == 1 { let epoch = self.epoch.load(Ordering::Relaxed); let global_epoch = self.global().epoch.load(Ordering::Relaxed).pinned(); if epoch != global_epoch { self.epoch.store(global_epoch, Ordering::Release); } }
+ }
+ 
+ fn acquire_handle(&self) {
+ let handle_count = self.handle_count.get();
+ debug_assert!(handle_count >= 1);
+ self.handle_count.set(handle_count + 1);
+ }
+ 
+ fn release_handle(&self) {
+ let guard_count = self.guard_count.get();
+ let handle_count = self.handle_count.get();
+ debug_assert!(handle_count >= 1);
+ self.handle_count.set(handle_count - 1);
+ if guard_count == 0 &&handle_count == 1 { self.finalize(); }
+ }
+ 
+ fn finalize(&self) {
+ debug_assert_eq!(self.guard_count.get(), 0);
+ debug_assert_eq!(self.handle_count.get(), 0);
+ self.handle_count.set(1);
+ unsafe { let guard = &self.pin(); self.global().push_bag(self.bag.with_mut(| b | &mut * b), guard); }
+ self.handle_count.set(0);
+ unsafe { let collector: Collector = ptr::read(self.collector.with(| c | &* (*c))); self.entry.delete(unprotected()); drop(collector); }
+ }
+ 
+}
+
+impl IsElement<Self> for Local {
+ fn entry_of(local: &Self) -> &Entry {
+ unsafe { let entry_ptr = (local as * const Self).cast::<Entry>(); &*entry_ptr }
+ }
+ 
+ fn element_of(entry: &Entry) -> &Self {
+ let local_ptr = (entry as * const Entry).cast::<Self>();
+ &*local_ptr
+ }
+ 
+ fn finalize(entry: &Entry, guard: &Guard) {
+ guard.defer_destroy(Shared::from(Self::element_of(entry) as * const _));
+ }
+ 
+}
+
+#[cfg(all(test, not(crossbeam_loom)))]
+mod tests {
+ use std::sync::atomic::{ AtomicUsize, Ordering };
+ use super::*;
+ #[test]
+ fn check_defer() {
+ static FLAG: AtomicUsize = AtomicUsize::new(0);
+ 
+ fn set() {
+ FLAG.store(42, Ordering::Relaxed);
+ }
+ 
+ let d = Deferred::new(set);
+ assert_eq!(FLAG.load(Ordering::Relaxed), 0);
+ d.call();
+ assert_eq!(FLAG.load(Ordering::Relaxed), 42);
+ }
+ 
+ #[test]
+ fn check_bag() {
+ static FLAG: AtomicUsize = AtomicUsize::new(0);
+ 
+ fn incr() {
+ FLAG.fetch_add(1, Ordering::Relaxed);
+ }
+ 
+ let mut bag = Bag::new();
+ assert!(bag.is_empty());
+ for _ in 0 .. MAX_OBJECTS { assert!(unsafe { bag.try_push(Deferred::new(incr)).is_ok() }); assert!(! bag.is_empty()); assert_eq!(FLAG.load(Ordering::Relaxed), 0); }
+ let result = unsafe { bag.try_push(Deferred::new(incr)) };
+ assert!(result.is_err());
+ assert!(! bag.is_empty());
+ assert_eq!(FLAG.load(Ordering::Relaxed), 0);
+ drop(bag);
+ assert_eq!(FLAG.load(Ordering::Relaxed), MAX_OBJECTS);
+ }
+ 
+}
+

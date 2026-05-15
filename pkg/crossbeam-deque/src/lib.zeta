@@ -1,0 +1,6 @@
+// Auto-converted from /tmp/df-crossbeam-deque-0.8.6/crossbeam-deque-0.8.6/src/lib.rs
+
+// [unsupported item]
+#[cfg(feature = "std")]
+mod deque;
+#[cfg(feature = "std")] pub use crate::deque::{ Injector, Steal, Stealer, Worker };

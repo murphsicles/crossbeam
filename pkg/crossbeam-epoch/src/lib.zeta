@@ -1,0 +1,79 @@
+// Auto-converted from /tmp/df-crossbeam-epoch-0.9.18/crossbeam-epoch-0.9.18/src/lib.rs
+
+// [unsupported item]
+#[cfg(crossbeam_loom)]
+mod primitive {
+ mod cell {
+ pub(crate) use loom::cell::UnsafeCell;
+ }
+ 
+ mod sync {
+ mod atomic {
+ pub(crate) use loom::sync::atomic::{ fence, AtomicPtr, AtomicUsize, Ordering };
+ pub(crate) use self::fence as compiler_fence;
+ }
+ 
+ pub(crate) use loom::sync::Arc;
+ }
+ 
+ pub(crate) use loom::thread_local
+}
+
+#[cfg(target_has_atomic = "ptr")]
+#[cfg(not(crossbeam_loom))]
+mod primitive {
+ mod cell {
+ #[derive(Debug)]
+ #[repr(transparent)]
+ struct UnsafeCell<T> {
+ (core::cell::UnsafeCell<T>),
+ }
+ 
+ impl<T> UnsafeCell<T> {
+ fn new(data: T) -> UnsafeCell<T> {
+ UnsafeCell(::core::cell::UnsafeCell::new(data))
+ }
+ 
+ fn with(&self, f: impl FnOnce) -> R {
+ f(self.0.get())
+ }
+ 
+ fn with_mut(&self, f: impl FnOnce) -> R {
+ f(self.0.get())
+ }
+ 
+ }
+ 
+ }
+ 
+ mod sync {
+ mod atomic {
+ pub(crate) use core::sync::atomic::{ compiler_fence, fence, AtomicPtr, AtomicUsize, Ordering };
+ }
+ 
+ #[cfg(feature = "alloc")] pub(crate) use alloc::sync::Arc;
+ }
+ 
+ #[cfg(feature = "std")] pub(crate) use std::thread_local
+}
+
+// [unsupported item]
+#[cfg(all(feature = "alloc", target_has_atomic = "ptr"))]
+mod atomic;
+#[cfg(all(feature = "alloc", target_has_atomic = "ptr"))]
+mod collector;
+#[cfg(all(feature = "alloc", target_has_atomic = "ptr"))]
+mod deferred;
+#[cfg(all(feature = "alloc", target_has_atomic = "ptr"))]
+mod epoch;
+#[cfg(all(feature = "alloc", target_has_atomic = "ptr"))]
+mod guard;
+#[cfg(all(feature = "alloc", target_has_atomic = "ptr"))]
+mod internal;
+#[cfg(all(feature = "alloc", target_has_atomic = "ptr"))]
+mod sync;
+#[cfg(all(feature = "alloc", target_has_atomic = "ptr"))] #[allow(deprecated)] pub use crate::atomic::{ CompareAndSetError, CompareAndSetOrdering };
+#[cfg(all(feature = "alloc", target_has_atomic = "ptr"))] pub use crate::{ atomic::{ Atomic, CompareExchangeError, Owned, Pointable, Pointer, Shared }, collector::{ Collector, LocalHandle }, guard::{ unprotected, Guard } };
+#[cfg(feature = "std")]
+mod default;
+#[cfg(feature = "std")] pub use crate::default::{ default_collector, is_pinned, pin };

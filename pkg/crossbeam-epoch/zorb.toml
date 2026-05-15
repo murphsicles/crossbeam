@@ -1,0 +1,5 @@
+[package]
+name = "@sync/crossbeam-epoch"
+version = "0.1.0"
+description = "Zeta port of crossbeam-epoch"
+license = "MIT"

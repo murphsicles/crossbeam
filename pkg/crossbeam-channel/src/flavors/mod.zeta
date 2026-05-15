@@ -1,0 +1,8 @@
+// Auto-converted from /tmp/df-crossbeam-channel-0.5.15/crossbeam-channel-0.5.15/src/flavors/mod.rs
+
+mod array;
+mod at;
+mod list;
+mod never;
+mod tick;
+mod zero;
